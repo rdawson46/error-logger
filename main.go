@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"time"
@@ -9,112 +10,82 @@ import (
 	"github.com/charmbracelet/log"
 )
 
-var logger = log.NewWithOptions(os.Stdout, log.Options{
-    ReportCaller: false,
-    ReportTimestamp: true,
-    TimeFormat: time.Kitchen,
-    Prefix: " ",
-});
-
-type simple_pack struct {
-    buf  []byte
-    amt  int
-    conn net.Conn
-}
+var logger = log.NewWithOptions(os.Stderr, log.Options{
+	ReportCaller:    false,
+	ReportTimestamp: true,
+	TimeFormat:      time.Kitchen,
+})
 
 type Message struct {
-    Code    uint8   `json:"code"`
-    Message string  `json:"message"`
+	Code    uint8  `json:"code"`
+	Message string `json:"message"`
 }
 
 type Response struct {
-    Code uint8      `json:"code"`
+	Code uint8 `json:"code"`
 }
 
-func handle_message(conn net.Conn, c chan <- simple_pack) {
-    buf := make([]byte, 1024)
-    n, err := conn.Read(buf)
-    
-    if err != nil {
-        logger.Fatalf("Connection %s failed to read", conn.RemoteAddr())
-    }
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	logger.Info("New connection", "remote_addr", conn.RemoteAddr())
 
-    var message Message
-    err = json.Unmarshal(buf[:n], &message)
+	buf := make([]byte, 1024)
 
-    if err != nil {
-        logger.Printf("Connection %s failed to convert", conn.RemoteAddr())
-        logger.Printf("Sending %s to simple", conn.RemoteAddr())
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				logger.Info("Connection closed by client", "remote_addr", conn.RemoteAddr())
+			} else {
+				logger.Warn("Failed to read from connection", "remote_addr", conn.RemoteAddr(), "error", err)
+			}
+			return
+		}
 
-        packet := simple_pack{
-            buf: buf,
-            amt: n,
-            conn: conn,
-        }
+		var msg Message
+		if json.Unmarshal(buf[:n], &msg) == nil {
+			logger.Info("Received structured log:",
+				"remote_addr", conn.RemoteAddr(),
+				"code", msg.Code,
+				"message", msg.Message,
+			)
 
-        c <- packet
-        return
-    }
+			response := Response{Code: 200}
+			res, err := json.Marshal(response)
+			if err != nil {
+				logger.Error("Failed to marshal JSON response", "error", err)
+				continue
+			}
+			conn.Write(res)
+		} else {
+			logger.Info("Received simple log:",
+				"remote_addr", conn.RemoteAddr(),
+				"mess", string(buf[:n]),
+			)
 
-    logger.Printf("Recieved from %s: %s [%d]", conn.RemoteAddr(), message.Message, message.Code)
-
-    // send response
-    response := Response{Code: 200}
-    res, err := json.Marshal(response)
-    logger.Printf("Sending to %s", conn.RemoteAddr())
-    conn.Write(res)
-}
-
-func simple_handle(listener <-chan simple_pack) {
-    logger.Info("Simple thread running")
-
-    for {
-        pack := <- listener
-
-        logger.Infof("Simple Rec from %s: %s", pack.conn.RemoteAddr(), string(pack.buf[:pack.amt]))
-        res := []byte("mes rec")
-        pack.conn.Write(res)
-
-        go keep_listening(pack.conn)
-    }
-}
-
-func keep_listening(conn net.Conn){
-    for {
-        buf := make([]byte, 1024)
-        n, err := conn.Read(buf)
-
-        if err != nil {
-            logger.Warnf("Connection with %s ended\n", conn.RemoteAddr())
-            return
-        }
-
-        logger.Infof("Read from %s: %s", conn.RemoteAddr(), string(buf[:n]))
-    }
+			conn.Write([]byte("log received"))
+		}
+	}
 }
 
 func main() {
-    server, err := net.Listen("tcp", "127.0.0.1:8000")
+	server, err := net.Listen("tcp", "127.0.0.1:8000")
+	if err != nil {
+		logger.Fatal("Could not start server", "error", err)
+	}
 
-    c := make(chan simple_pack)
+	defer server.Close()
 
-    if err != nil {
-        logger.Error("Couldn't listen on port")
-        return
-    }
+	logger.Info("TCP server listening", "address", server.Addr())
 
-    go simple_handle(c)
+	for {
+		conn, err := server.Accept()
 
-    logger.Infof("Listening on %s", server.Addr())
+		if err != nil {
+			logger.Warn("Failed to accept connection", "error", err)
+			continue
+		}
 
-    for {
-        conn, err := server.Accept()
-
-        if err != nil {
-            logger.Warn("bad connection")
-            continue
-        }
-
-        go handle_message(conn, c)
-    }
+		go handleConnection(conn)
+	}
 }
